@@ -1,0 +1,35 @@
+# 编译产物
+*.dll
+*.exe
+*.o
+*.obj
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 密钥文件（不要提交到公开仓库）
+rsa_private.pem
+rsa_public.pem
+xor_key.bin
+encoded_key.bin
+license.dat
+patch_rsa.bin
+
+# 截图
+*.bmp
+*.png
+*.jpg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
