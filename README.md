@@ -10,6 +10,14 @@ Binary Ninja 逆向工程工具的许可证验证绕过方案合集，包含三�
 | EXE 通用补丁 | 字符串锚点定位 + JNE→JMP | 中 | ★★ |
 | RSA 注册机 | 替换公钥 + 生成 license.dat | 高 | ★ |
 
+## 通用技能
+
+本项目的逆向方法论已固化为通用技能 `license-keygen`
+（`C:\Users\Lenovo\.claude\skills\license-keygen\`），用于寻找其他软件的
+许可证生成破解方案：分类验证谱系 → 定位验证逻辑 → 识别密钥材料 →
+选择攻击原语（密钥替换/密钥提取/凭证伪造）→ 还原凭证格式 → 生成 keygen。
+Binary Ninja 案例见该技能 `examples/binaryninja.md`。
+
 ## 目录结构
 
 ```
