@@ -1,70 +1,76 @@
-# keygen 重新实现方案设计
+# keygen 单文件方案设计
 
 > 适用版本：v5.3.9434，其它版本自测
 > 使用说明：仅供测试、需要修改 RSA N
 
-## 1. 目标
+## 1. 设计目标
 
-重新实现 `keygen/` 目录下的 RSA 注册机，解决旧实现的问题：
+将 keygen 收敛为**单文件**脚本，使用风格与 `exe-patch/patch_universal.py` 对齐（扁平参数），
+一键完成"生成密钥 → 替换 DLL 中 RSA N → 签发 license"。
 
-| 问题 | 说明 |
+| 需求 | 实现 |
 |------|------|
-| 单文件大杂烩 | 265 行混排模式搜索、XOR 定位、补丁、license 生成 |
-| 密钥硬编码 | 私钥/公钥以超长 hex 内嵌，无法替换 |
-| 无参数化 | 邮箱/数量/序列号写死，DLL 路径写死 |
-| 不可独立验证 | 无法单独验证 DLL 中 N 是否与私钥匹配 |
-| 无备份恢复 | patch 前不备份，无法还原原版 N |
+| 单文件 | 定位/替换、密钥、license 签发、CLI 合并于 `keygen.py` |
+| 一键流程 | 默认运行：生成密钥（复用已有）→ patch → license |
+| 工作目录 | 默认脚本所在目录，`--work-dir` 指定（密钥存放处） |
+| license 位置 | 默认 DLL 所在目录，`--license-dir` 指定 |
+| 可恢复 | `--restore` 从 `.bak` 还原；patch 前自动备份 |
+| 可预览 | `--dry-run` 仅定位不写入 |
+| 可校验 | `--verify` 检查 DLL 中 N 与私钥匹配；写回后自校验 |
 
-## 2. 设计
-
-### 2.1 模块划分
-
-```
-keygen/
-├── keygen.py          # 主入口，argparse CLI 子命令
-├── bn_rsa.py          # 密钥对生成、DER 编解码、license 签名
-├── bn_patch.py        # DLL 定位：指令模式、XOR 密钥、N 提取/替换
-└── README.md          # 使用文档
-```
-
-### 2.2 CLI 接口
+## 2. 模块划分（单文件内分段）
 
 ```
-python keygen.py extract  <dll>            # 提取 DLL 中当前 N，输出 hex/PEM
-python keygen.py genkey   [--out-dir .]    # 生成新 RSA-2048 密钥对
-python keygen.py patch    <dll> --key rsa_public.pem   # 替换 DLL 中 N（自动备份 .bak）
-python keygen.py restore  <dll>            # 从 .bak 恢复原版 N
-python keygen.py license  --key rsa_private.pem [--email E] [--count N] [--serial S]
-                                           # 生成 license.dat
-python keygen.py verify   <dll> --key rsa_private.pem [--license license.dat]
-                                           # 校验 DLL 中 N 与私钥匹配 + license 签名
-python keygen.py patch    <dll> --genkey  # 一键：生成密钥对 + 替换 N + 签发 license
+keygen.py
+├── 常量        KEY_BITS / PATCH_LENGTH / DATA_MAGIC
+├── 模块 A      DLL 公钥定位与替换
+│   ├── build_pattern_instructions()   74 条 C7 指令模板
+│   ├── locate_operands()              模式搜索 → 操作数偏移
+│   ├── locate_xor_key()               XOR 密钥定位
+│   ├── xor_encode/decode_pubkey()     编解码（对称逆运算）
+│   ├── extract_pubkey_der()           提取当前 N
+│   ├── patch_pubkey()                 替换 N（备份 + 写回自校验）
+│   └── restore_pubkey()               从 .bak 还原
+├── 模块 B      RSA 密钥与 license
+│   ├── generate_keypair()             生成 RSA-2048
+│   ├── generate_license()             构造 7 字段 + SHA256 + PKCS1v1.5 签名
+│   └── verify_license()               验签
+└── 模块 C      CLI（扁平参数，对齐 exe-patch）
+    └── main()                         --dll / --restore / --dry-run /
+                                       --extract / --verify / --work-dir /
+                                       --license-dir / --email / --count
 ```
 
-### 2.3 关键算法（沿用已验证逻辑，重构命名）
+## 3. 关键算法
 
-- `build_pattern_instructions()` → `KEY_PATTERN`：74 条 `C7` 指令模板
-- `search_pattern_operand_locations()` → `locate_pubkey_operands()`：模式搜索
-- `find_xor_key()` / `find_xor_key_backup()` → `locate_xor_key()`：XOR 密钥定位
-- `transform()` → `xor_encode_pubkey()`：DER → XOR 编码字节流
-- `gen_signature()` / `kg()` → `sign_license()` / `build_license()`：license 签发
+### 3.1 公钥存储（逆向结论）
 
-### 2.4 备份与安全
+- 位置：`binaryninjacore.dll` 偏移 `0x14A33AA`（v5.3.9434）
+- 结构：74 条 `mov dword ptr [reg+disp], imm32` × 4B = 296B
+- 编码：SPKI DER 每 4 字节小端 XOR `0x5D65DB32` 后逐字节展开
+- 解码：XOR 密钥紧邻指令序列后，由 `xor reg, imm32` 指令定位（动态，不硬编码）
 
-- patch 前若存在 `.bak` 则跳过备份（不覆盖原备份）；否则复制为 `<dll>.bak`
-- `restore` 用 `.bak` 覆盖回当前 DLL
-- 密钥文件默认输出到 `--out-dir`，配合 `.gitignore` 不入库
+### 3.2 license 结构
 
-## 3. 验证方案
+```
+msg = product \x00 email \x00 serial \x00 created \x00 type \x00 count \x00 data
+signature = PKCS1v1.5_sign(SHA256(msg))
+data = base64(0x100 随机 + RC4(MD5(随机), 8B magic))
+```
 
-1. 副本 DLL 上 `extract` → 与原版 N 比对，确认提取正确
-2. `genkey` → `patch` 副本 → `extract` → 确认 N == 新公钥 N
-3. `license` → 用 DLL 中新 N 验签 license → 通过
-4. `restore` 副本 → `extract` → 确认 N 恢复原版
-5. 真实环境：先备份当前 DLL 状态，patch 后用 Binary Ninja 启动验证（GUI 冒烟）
+### 3.3 一键流程
 
-## 4. 与旧实现的兼容
+```
+--dll 缺省 → 当前目录/脚本目录查找 binaryninjacore.dll
+工作目录无私钥 → 生成 rsa_private.pem / rsa_public.pem
+定位模式 + XOR 密钥 → 打印 当前N / 新N
+dry-run? → 结束
+patch：备份 .bak → 编码新 DER → 写回 296 字节 → 重新提取对比（自校验）
+license：签发 license.dat 到 --license-dir（默认 DLL 目录）
+```
 
-- 旧 `keygen.py` 的 `kg()` / `gen_signature()` 接口保留在 `bn_rsa.py` 中
-- 内嵌密钥对不再硬编码在主流程；`--genkey` 一键模式生成全新密钥对
-- 依赖保持 `pycryptodome` 单一库
+## 4. 验证
+
+- 副本 DLL 端到端：extract 原版 N → 一键 → verify 匹配 → restore 还原
+- 幂等：重复一键复用已有密钥对
+- 恢复：`.bak` 不被二次 patch 覆盖

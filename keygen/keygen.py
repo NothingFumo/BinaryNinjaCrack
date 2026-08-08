@@ -1,170 +1,428 @@
 # -*- coding: utf-8 -*-
-"""Binary Ninja 授权生成器（keygen）。
+"""Binary Ninja 授权生成器（单文件版）。
 
 适用版本：v5.3.9434，其它版本自测。
-使用说明：仅供测试、需要修改 RSA N —— 必须将 DLL 中内嵌的
-原版公钥 N 替换为自定义密钥对的公钥 N，license 才能验签通过。
+使用说明：仅供测试、需要修改 RSA N —— 必须将 DLL 中内嵌的原版
+公钥 N 替换为自定义密钥对的公钥 N，license 才能验签通过。
 
-子命令：
-  extract  提取 DLL 中当前公钥 N
-  genkey   生成新 RSA 密钥对
-  patch    用指定公钥替换 DLL 中 N（自动备份 .bak）
-  restore  从 .bak 恢复原版 DLL
-  license  生成 license.dat
-  verify   校验 DLL 中 N 与私钥匹配及 license 签名
+用法（与 exe-patch 风格一致）:
+  cd keygen
+  python keygen.py --dll "D:\\BinaryNinja\\binaryninjacore.dll"
+  python keygen.py --dll "D:\\BinaryNinja\\binaryninjacore.dll" --restore  # 恢复
+  python keygen.py --dll "D:\\BinaryNinja\\binaryninjacore.dll" --dry-run  # 仅分析
+
+一键流程（默认）:
+  1. 生成 RSA-2048 密钥对（已存在则复用，存放于工作目录）
+  2. 定位并替换 DLL 中的公钥 N（自动备份 .bak）
+  3. 生成 license.dat 到 DLL 所在目录
+
+辅助:
+  --extract  仅提取 DLL 当前 N（不写入）
+  --verify   校验 DLL 中 N 与私钥匹配 + license 验签
 """
 import argparse
+import base64
+import hashlib
+import json
+import random
 import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
+from Crypto.Cipher import ARC4
+from Crypto.Hash import SHA256
 from Crypto.PublicKey import RSA
+from Crypto.Signature import pkcs1_15
 
-import bn_patch
-import bn_rsa
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
 
-KEY_BITS = 2048
+KEY_BITS = 2048              # RSA 密钥长度
+PATCH_LENGTH = 0x128         # 公钥存储区长度（296 字节 = DER 294B + 2B padding）
+DATA_MAGIC = bytes.fromhex("9C2AAA09A4E2252B0BA125DB1E1CD272207D97CCA8446899")
+DEFAULT_EMAIL = "hi@binja.com"
+DEFAULT_COUNT = 999
 
-
-def cmd_extract(args):
-    data = Path(args.dll).read_bytes()
-    der = bn_patch.extract_pubkey_der(data)
-    key = RSA.import_key(der[:294])
-    n_bytes = key.n.to_bytes((key.size_in_bits() + 7) // 8, "big")
-    print(f"DLL:       {args.dll}")
-    print(f"位长:      {key.size_in_bits()} bit (e=0x{key.e:X})")
-    print(f"N (hex):   {n_bytes.hex()}")
-    if args.out:
-        Path(args.out).write_bytes(der[:294])
-        print(f"DER 已写入: {args.out}")
-    return 0
+# ---------------------------------------------------------------------------
+# 模块 A：DLL 中 RSA 公钥 N 的定位与替换
+# 公钥以 XOR 编码的 SPKI DER 存储在 C7 指令序列的 imm32 操作数中：
+# 74 条 `mov dword ptr [reg+disp], imm32` × 4 字节 = 296 字节。
+# ---------------------------------------------------------------------------
 
 
-def cmd_genkey(args):
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    priv, pub = bn_rsa.generate_keypair(KEY_BITS)
-    priv_path = out_dir / "rsa_private.pem"
-    pub_path = out_dir / "rsa_public.pem"
+def build_pattern_instructions():
+    """构建 74 条 C7 指令的字节模板（0x00..0x124 偏移）。"""
+    pattern = [[0xC7, 0x00, None, None, None, None]]
+    offset = 0x04
+    while offset <= 0x7C:
+        pattern.append([0xC7, 0x40, offset, None, None, None, None])
+        offset += 4
+    offset = 0x80
+    while offset <= 0xFC:
+        pattern.append(
+            [0xC7, 0x80, offset, 0x00, 0x00, 0x00, None, None, None, None]
+        )
+        offset += 4
+    while offset <= 0x124:
+        pattern.append(
+            [0xC7, 0x80, offset - 0x100, 0x01, 0x00, 0x00, None, None, None, None]
+        )
+        offset += 4
+    return pattern
+
+
+def locate_operands(binary: bytes, max_gap: int = 32):
+    """搜索指令模式，返回 (模式起始偏移, 操作数偏移列表) 或 (None, None)。"""
+    pattern = build_pattern_instructions()
+    n = len(binary)
+    first = pattern[0]
+    plen = len(first)
+
+    i = 0
+    while i <= n - plen:
+        operand_groups = []
+        match = True
+        instr_locs = []
+        for j in range(plen):
+            if first[j] is None:
+                instr_locs.append(i + j)
+            elif binary[i + j] != first[j]:
+                match = False
+                break
+        if not match:
+            i += 1
+            continue
+        operand_groups.append(instr_locs)
+        last_pos = i
+
+        for instr in pattern[1:]:
+            instr_len = len(instr)
+            found = False
+            search_limit = min(last_pos + 1 + max_gap, n - instr_len + 1)
+            for k in range(last_pos + 1, search_limit):
+                sub_match = True
+                instr_locs = []
+                for l in range(instr_len):
+                    if instr[l] is None:
+                        instr_locs.append(k + l)
+                    elif binary[k + l] != instr[l]:
+                        sub_match = False
+                        break
+                if sub_match:
+                    operand_groups.append(instr_locs)
+                    last_pos = k
+                    found = True
+                    break
+            if not found:
+                match = False
+                break
+        if match:
+            return i, [loc for group in operand_groups for loc in group]
+        i += 1
+    return None, None
+
+
+def locate_xor_key(binary: bytes, end_offset: int, search_bytes: int = 150):
+    """在模式结束位置之后定位 XOR 密钥（xor reg, imm32 或经寄存器传递）。"""
+    i = end_offset
+    max_offset = min(len(binary), i + search_bytes)
+    reg_map = {}
+
+    while i < max_offset - 5:
+        opcode = binary[i]
+        if opcode == 0x35 and (binary[i + 1] >> 3) & 7 == 6:
+            return int.from_bytes(binary[i + 1 : i + 5], "little")
+        if 0xB8 <= opcode <= 0xBF:  # mov reg, imm32
+            reg_map[opcode - 0xB8] = int.from_bytes(binary[i + 1 : i + 5], "little")
+            i += 5
+            continue
+        if opcode == 0x81 and (binary[i + 1] >> 3) & 7 == 6:  # xor reg, imm32
+            return int.from_bytes(binary[i + 2 : i + 6], "little")
+        if opcode == 0x31:  # xor reg, reg
+            reg_src = (binary[i + 1] >> 3) & 7
+            if reg_src in reg_map:
+                return reg_map[reg_src]
+        i += 1
+    return None
+
+
+def xor_encode_pubkey(pubkey_der: bytes, length: int, xor_key: int) -> bytes:
+    """DER → XOR 编码字节流（固定长度）。"""
+    table = [
+        int.from_bytes(pubkey_der[i : i + 4], "little")
+        for i in range(0, len(pubkey_der), 4)
+    ]
+    dst = bytearray(length)
+    for i in range(length):
+        rax = i >> 2
+        edx = table[rax] ^ xor_key
+        shift = (i & 3) << 3
+        dst[i] = (edx >> shift) & 0xFF
+    return bytes(dst)
+
+
+def xor_decode_pubkey(encoded: bytes, xor_key: int) -> bytes:
+    """XOR 编码流 → DER 字节流。"""
+    return b"".join(
+        (int.from_bytes(encoded[i : i + 4], "little") ^ xor_key).to_bytes(4, "little")
+        for i in range(0, len(encoded), 4)
+    )
+
+
+@dataclass
+class PubkeyLocation:
+    start_offset: int
+    operand_offsets: list
+    xor_key: int
+    length: int
+
+
+def locate_pubkey(binary: bytes, max_gap: int = 32) -> PubkeyLocation:
+    """在 DLL 字节流中定位公钥存储区。"""
+    start, operands = locate_operands(binary, max_gap)
+    if start is None:
+        raise ValueError("C7 指令模式未找到，DLL 版本可能不兼容")
+    end = operands[-1] + 1
+    xor_key = locate_xor_key(binary, end)
+    if xor_key is None:
+        raise ValueError("XOR 密钥定位失败")
+    return PubkeyLocation(start, operands, xor_key, len(operands))
+
+
+def extract_pubkey_der(binary: bytes) -> bytes:
+    """从 DLL 提取解码后的公钥 DER（294 字节）。"""
+    loc = locate_pubkey(binary)
+    encoded = bytes(binary[off] for off in loc.operand_offsets)
+    return xor_decode_pubkey(encoded, loc.xor_key)[:294]
+
+
+def patch_pubkey(dll_path, pubkey_der: bytes, backup: bool = True) -> PubkeyLocation:
+    """将新公钥 DER 写入 DLL 的 N 存储区。"""
+    dll = Path(dll_path)
+    if backup:
+        backup_path = dll.with_suffix(dll.suffix + ".bak")
+        if not backup_path.exists():
+            backup_path.write_bytes(dll.read_bytes())
+    data = bytearray(dll.read_bytes())
+    loc = locate_pubkey(bytes(data))
+    if len(pubkey_der) + 2 > loc.length:
+        raise ValueError(
+            f"公钥 DER 过长：{len(pubkey_der)} 字节，存储区仅 {loc.length} 字节"
+        )
+    encoded = xor_encode_pubkey(pubkey_der, loc.length, loc.xor_key)
+    for off, byte in zip(loc.operand_offsets, encoded):
+        data[off] = byte
+    dll.write_bytes(bytes(data))
+    return loc
+
+
+def restore_pubkey(dll_path) -> Path:
+    """从 .bak 恢复原版 DLL。"""
+    dll = Path(dll_path)
+    backup = dll.with_suffix(dll.suffix + ".bak")
+    if not backup.exists():
+        raise FileNotFoundError(f"备份文件不存在：{backup}")
+    dll.write_bytes(backup.read_bytes())
+    return backup
+
+
+# ---------------------------------------------------------------------------
+# 模块 B：RSA 密钥与 license 签发
+# license 验签消息 = 7 字段按序以 \x00 连接，SHA256 + PKCS#1 v1.5 签名。
+# ---------------------------------------------------------------------------
+
+
+def generate_keypair(bits: int = KEY_BITS):
+    key = RSA.generate(bits)
+    return key, key.publickey()
+
+
+def get_time_str() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def gen_licdata() -> str:
+    """data 字段：0x100 随机字节（MD5 作 RC4 密钥）加密固定 magic，base64。"""
+    randdata = random.randbytes(0x100)
+    encdta = ARC4.new(key=hashlib.md5(randdata).digest()).encrypt(DATA_MAGIC)
+    return base64.standard_b64encode(randdata + encdta).decode()
+
+
+def build_license_message(lic: dict) -> bytes:
+    return "\x00".join(
+        (
+            lic["product"],
+            lic["email"],
+            lic["serial"],
+            lic["created"],
+            lic["type"],
+            str(lic["count"]),
+            lic["data"],
+        )
+    ).encode()
+
+
+def generate_license(
+    email: str,
+    count: int = DEFAULT_COUNT,
+    serial_hexstr: str = None,
+    product: str = "Binary Ninja Personal",
+    lic_type: str = "User",
+    private_key=None,
+) -> str:
+    """生成 license.dat 文本（JSON 数组格式）。"""
+    if serial_hexstr is None:
+        serial_hexstr = random.randbytes(0x10).hex()
+    lic = {
+        "product": product,
+        "email": email,
+        "serial": serial_hexstr,
+        "created": get_time_str(),
+        "type": lic_type,
+        "count": count,
+        "data": gen_licdata(),
+    }
+    sig = pkcs1_15.new(private_key).sign(SHA256.new(build_license_message(lic)))
+    lic["signature"] = base64.standard_b64encode(sig).decode()
+    return "[\n%s\n]" % json.dumps(lic, indent=0)
+
+
+def verify_license(lic: dict, public_key, signature: bytes) -> bool:
+    try:
+        pkcs1_15.new(public_key).verify(
+            SHA256.new(build_license_message(lic)), signature
+        )
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 模块 C：CLI（扁平参数，与 exe-patch 风格一致）
+# ---------------------------------------------------------------------------
+
+
+def default_workdir() -> Path:
+    """默认工作目录 = 脚本所在目录。"""
+    return Path(__file__).resolve().parent
+
+
+def key_paths(workdir: Path):
+    return workdir / "rsa_private.pem", workdir / "rsa_public.pem"
+
+
+def load_or_create_keypair(workdir: Path):
+    """加载工作目录中的密钥对；不存在则生成。"""
+    priv_path, pub_path = key_paths(workdir)
+    if priv_path.exists() and pub_path.exists():
+        priv = RSA.import_key(priv_path.read_bytes())
+        return priv, priv.publickey(), False
+    priv, pub = generate_keypair()
     priv_path.write_text(priv.export_key().decode())
     pub_path.write_text(pub.export_key().decode())
-    print(f"私钥: {priv_path}")
-    print(f"公钥: {pub_path}")
-    return 0
+    print(f"已生成密钥对: {priv_path} / {pub_path}")
+    return priv, pub, True
 
 
-def cmd_patch(args):
-    pub_data = Path(args.key).read_bytes()
-    key = RSA.import_key(pub_data)
-    if key.size_in_bits() != KEY_BITS:
-        print(f"警告: 密钥位长 {key.size_in_bits()}，目标版本为 {KEY_BITS}", file=sys.stderr)
-    der = bn_rsa.public_key_to_der(key)
-    if len(der) + 2 > 0x128:
-        raise ValueError(f"公钥 DER 过长: {len(der)} 字节 > 存储区 {0x128 - 2} 字节")
-    loc = bn_patch.patch_pubkey(args.dll, der, backup=not args.no_backup)
-    # 验证写回
-    data = Path(args.dll).read_bytes()
-    back = bn_patch.extract_pubkey_der(data)
-    ok = back[: len(der)] == der
-    n_bytes = key.n.to_bytes(256, "big")
-    print(f"模式起始:  0x{loc.start_offset:X}")
-    print(f"XOR 密钥:  0x{loc.xor_key:08X}")
-    print(f"写入字节:  {loc.length}")
-    print(f"新 N:      {n_bytes.hex()}")
-    print(f"写回校验:  {'通过' if ok else '失败!'}")
-    print("下一步: 用同一私钥生成 license 并放入安装目录")
-    return 0 if ok else 1
-
-
-def cmd_restore(args):
-    backup = bn_patch.restore_pubkey(args.dll)
-    print(f"已从 {backup} 恢复 {args.dll}")
-    return 0
-
-
-def cmd_license(args):
-    key_data = Path(args.key).read_bytes()
-    priv = RSA.import_key(key_data)
-    text = bn_rsa.generate_license(
-        email=args.email,
-        count=args.count,
-        serial_hexstr=args.serial,
-        product=args.product,
-        lic_type=args.type,
-        private_key=priv,
+def find_default_dll() -> Path:
+    """默认 DLL：当前目录或脚本目录下的 binaryninjacore.dll。"""
+    for base in (Path.cwd(), Path(__file__).resolve().parent):
+        cand = base / "binaryninjacore.dll"
+        if cand.exists():
+            return cand
+    raise FileNotFoundError(
+        "未找到 binaryninjacore.dll，请用 --dll 指定安装目录中的文件"
     )
-    out = args.out or "license.dat"
-    Path(out).write_text(text, encoding="utf-8")
-    print(f"license 已生成: {out}")
-    return 0
 
 
-def cmd_verify(args):
-    der = bn_patch.extract_pubkey_der(Path(args.dll).read_bytes())
-    key = RSA.import_key(der[:294])
-    n_hex = key.n.to_bytes(256, "big").hex()
-    priv_data = Path(args.key).read_bytes()
-    priv = RSA.import_key(priv_data)
-    match = key.n == priv.n
-    print(f"DLL 中 N:    {n_hex}")
-    print(f"私钥匹配:    {'是' if match else '否'}")
-    if args.license:
-        lic = bn_rsa.license_from_text(Path(args.license).read_text(encoding="utf-8"))
-        from Crypto.Signature import pkcs1_15
-        import base64
-
-        ok = bn_rsa.verify_license(
-            lic, key, base64.b64decode(lic["signature"])
-        )
-        print(f"license 验签: {'通过' if ok else '失败'}")
-    return 0 if match else 1
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(
+def main():
+    ap = argparse.ArgumentParser(
         prog="keygen",
-        description="Binary Ninja 授权生成器（需要修改 RSA N）",
+        description="Binary Ninja 授权生成器（单文件，需要修改 RSA N）",
     )
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    ap.add_argument("--dll", default=None, help="binaryninjacore.dll 路径（默认自动查找）")
+    ap.add_argument("--work-dir", default=str(default_workdir()),
+                    help="工作目录（密钥存放，默认脚本所在目录）")
+    ap.add_argument("--license-dir", default=None,
+                    help="license 输出目录（默认 DLL 所在目录）")
+    ap.add_argument("--restore", action="store_true", help="从备份恢复原版 DLL")
+    ap.add_argument("--dry-run", action="store_true", help="仅分析，不写入")
+    ap.add_argument("--extract", action="store_true", help="仅提取 DLL 当前 N")
+    ap.add_argument("--verify", action="store_true", help="校验 DLL 中 N 与私钥匹配")
+    ap.add_argument("--email", default=DEFAULT_EMAIL, help="license 邮箱")
+    ap.add_argument("--count", type=int, default=DEFAULT_COUNT, help="license 授权数量")
+    ap.add_argument("--serial", default=None, help="license 序列号（hex）")
+    ap.add_argument("--no-backup", action="store_true", help="patch 前不备份 .bak")
+    args = ap.parse_args()
 
-    p = sub.add_parser("extract", help="提取 DLL 中当前公钥 N")
-    p.add_argument("dll", help="binaryninjacore.dll 路径")
-    p.add_argument("--out", help="输出 DER 到文件")
-    p.set_defaults(func=cmd_extract)
-
-    p = sub.add_parser("genkey", help="生成新 RSA 密钥对")
-    p.add_argument("--out-dir", default=".", help="输出目录（默认当前目录）")
-    p.set_defaults(func=cmd_genkey)
-
-    p = sub.add_parser("patch", help="用公钥替换 DLL 中 N")
-    p.add_argument("dll", help="binaryninjacore.dll 路径")
-    p.add_argument("--key", required=True, help="公钥 PEM 文件")
-    p.add_argument("--no-backup", action="store_true", help="不备份 .bak")
-    p.set_defaults(func=cmd_patch)
-
-    p = sub.add_parser("restore", help="从 .bak 恢复原版 DLL")
-    p.add_argument("dll", help="binaryninjacore.dll 路径")
-    p.set_defaults(func=cmd_restore)
-
-    p = sub.add_parser("license", help="生成 license.dat")
-    p.add_argument("--key", required=True, help="私钥 PEM 文件")
-    p.add_argument("--email", default="hi@binja.com", help="邮箱")
-    p.add_argument("--count", type=int, default=32, help="授权数量")
-    p.add_argument("--serial", help="序列号（hex，默认随机）")
-    p.add_argument("--product", default="Binary Ninja Personal", help="产品名")
-    p.add_argument("--type", default="User", help="许可类型")
-    p.add_argument("--out", help="输出文件（默认 license.dat）")
-    p.set_defaults(func=cmd_license)
-
-    p = sub.add_parser("verify", help="校验 DLL 中 N 与私钥匹配")
-    p.add_argument("dll", help="binaryninjacore.dll 路径")
-    p.add_argument("--key", required=True, help="私钥 PEM 文件")
-    p.add_argument("--license", help="license.dat 路径（可选，额外验签）")
-    p.set_defaults(func=cmd_verify)
-
-    args = parser.parse_args(argv)
     try:
-        return args.func(args)
-    except (ValueError, FileNotFoundError) as e:
+        dll = Path(args.dll) if args.dll else find_default_dll()
+
+        if args.restore:
+            backup = restore_pubkey(dll)
+            print(f"已从 {backup} 恢复 {dll}")
+            return 0
+
+        if args.extract:
+            der = extract_pubkey_der(dll.read_bytes())
+            key = RSA.import_key(der)
+            print(f"DLL:      {dll}")
+            print(f"位长:     {key.size_in_bits()} bit (e=0x{key.e:X})")
+            print(f"N (hex):  {key.n.to_bytes(256, 'big').hex()}")
+            return 0
+
+        if args.verify:
+            der = extract_pubkey_der(dll.read_bytes())
+            key = RSA.import_key(der)
+            priv_path, _ = key_paths(Path(args.work_dir))
+            if not priv_path.exists():
+                print(f"错误: 工作目录中无私钥 {priv_path}，先运行一键生成", file=sys.stderr)
+                return 1
+            priv = RSA.import_key(priv_path.read_bytes())
+            match = key.n == priv.n
+            print(f"DLL 中 N:  {key.n.to_bytes(256, 'big').hex()}")
+            print(f"私钥匹配:  {'是' if match else '否'}")
+            return 0 if match else 1
+
+        # 一键：生成密钥 → patch → license
+        workdir = Path(args.work_dir)
+        workdir.mkdir(parents=True, exist_ok=True)
+        priv, pub, created = load_or_create_keypair(workdir)
+        der = pub.export_key(format="DER")
+
+        loc = locate_pubkey(dll.read_bytes())
+        print(f"DLL:        {dll}")
+        print(f"模式起始:   0x{loc.start_offset:X}")
+        print(f"XOR 密钥:   0x{loc.xor_key:08X}")
+        print(f"当前 N:     {RSA.import_key(extract_pubkey_der(dll.read_bytes())).n.to_bytes(256, 'big').hex()}")
+        print(f"新 N:       {pub.n.to_bytes(256, 'big').hex()}")
+
+        if not args.dry_run:
+            patch_pubkey(dll, der, backup=not args.no_backup)
+            # 写回自校验
+            back = extract_pubkey_der(dll.read_bytes())
+            if back != der:
+                raise RuntimeError("写回校验失败，DLL 中的 N 与公钥不一致")
+            print("写回校验:   通过")
+
+            lic_dir = Path(args.license_dir) if args.license_dir else dll.parent
+            lic_dir.mkdir(parents=True, exist_ok=True)
+            lic_path = lic_dir / "license.dat"
+            lic_path.write_text(
+                generate_license(
+                    email=args.email,
+                    count=args.count,
+                    serial_hexstr=args.serial,
+                    private_key=priv,
+                ),
+                encoding="utf-8",
+            )
+            print(f"license:    {lic_path}")
+            print("完成：将 license.dat 放入 Binary Ninja 安装目录后启动即可")
+        return 0
+    except (ValueError, FileNotFoundError, OSError) as e:
         print(f"错误: {e}", file=sys.stderr)
         return 1
 
