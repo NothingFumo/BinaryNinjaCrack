@@ -1,265 +1,173 @@
-import binascii
-import base64
-import hashlib
-import json
-import random
-from Crypto.Cipher import ARC4
+# -*- coding: utf-8 -*-
+"""Binary Ninja 授权生成器（keygen）。
+
+适用版本：v5.3.9434，其它版本自测。
+使用说明：仅供测试、需要修改 RSA N —— 必须将 DLL 中内嵌的
+原版公钥 N 替换为自定义密钥对的公钥 N，license 才能验签通过。
+
+子命令：
+  extract  提取 DLL 中当前公钥 N
+  genkey   生成新 RSA 密钥对
+  patch    用指定公钥替换 DLL 中 N（自动备份 .bak）
+  restore  从 .bak 恢复原版 DLL
+  license  生成 license.dat
+  verify   校验 DLL 中 N 与私钥匹配及 license 签名
+"""
+import argparse
+import sys
+from pathlib import Path
+
 from Crypto.PublicKey import RSA
-from Crypto.Signature import pkcs1_15
-from Crypto.Util.number import long_to_bytes,bytes_to_long
-from Crypto.Hash import SHA256
-from datetime import datetime, timezone
 
-def get_time_str():
-    utc_now = datetime.now(timezone.utc)
-    iso_str = utc_now.isoformat(timespec='milliseconds')
+import bn_patch
+import bn_rsa
 
-    return iso_str
+KEY_BITS = 2048
 
-def gen_licdata():
-    randdata=random.randbytes(0x100)
-    k=hashlib.md5(randdata).digest()
-    rc4=ARC4.new(key=k)
-    rc4data=bytes.fromhex('9C2AAA09A4E2252B0BA125DB1E1CD272207D97CCA8446899')
-    encdta=rc4.encrypt(rc4data)
-    # print('rc4enc:',encdta.hex())
 
-    ret=base64.standard_b64encode(randdata+encdta)
-    # print('data:',ret)
-    return ret
-def gen_signature(msg,pri_data=bytes.fromhex('''308204A30201000282010100D2BF8069B298618B54272B13CE402C37826D906FA0DB47C916E304D61CFE847306AD1763A332A6FACBEF133DE5E634B333739EFFFE9F7513F7C38CDF4EB7CE27B56B728424F9410DB4CD3AB33D2A367123470D62324211876D83C15B59FB7A4D5A74E56F9E443DBEFF30289D3E4F84E58E6AB23AD4F43870034605E68EDF1FF90256AA027C6102981B8A7742C3DCFC536A4D98C4E22702F2BFFDE2985E232A2446D5750E20EDD27E59FA2475CFF2882CA33347209F62DED6965D85B03BDE6E02B99F680F33B7DC08F8730C0BCE62256FCA5613213A1182C00A36A9D496629D15C1B604550F97388C2DFD60CC8DC15CF5D61A829167CE07F9798168C92D6037470203010001028201005BC7FDC74A79D58565C5571BDD87921A2CA9C5ACEFCB7FD4622CC536F052A1E12C67A6978483F337A727FBE3C9A33B914D978D87E45E9290FB26C54B9D4F2C2F9BF16AE284EDAE78A72477EB867843547B6E1EB484B9C4438C1CC4D1217B855479D00DF9D1DDDB5C3A6BC14C55CE30CCFE7C96194C13FE1E3E36B92C234DA5F0B362663B5B353949FF83F3987080A20326CC8A4FC5E51FF5A91026BB72F1BF4EAA5EB893892E2AC6FEB828EC2D093F992589D7EDEE5DA8EA94C6F8EA61E1FF1D3686EE2B97859E0123CF438F457C97860C04263380EE82C84DB0CADCE121C93F5AD1EB0A802C7ABFF14B4265805CAC6C37F4BF4E17B034E29F3DE64EA98450CD02818100FFDC7E6D1275D1956316116CD79CD5A44F76A6284DD3C35E5A607C1C612D454BFB94DFF5EE63DDB695C8E3A9E398D188A25100959C632DBD3A23FC31F975484D1531151AA7CD6711C960018E366F1507FEB787757464F7E2F05AD097DAD9C8D34BAB3BD584948C7DABD750B3F9B651C3FCDE7133232CA2228F7880410A7FC89502818100D2DCBF521CC7FC91AE554A7ADE811CA07356C50227EC07A4DB06A2B681E29CA8F4D54A7D40D7DFAA38A1B6F03D9E4ACFBEF7C7AC45A6496C94BFD8FA0FB1C2528097AAACFDD0FAA5C9CD42A010018CB04A488A6437B5F4328B30D2FBE9290AA3C9937DD1DB92DFAE4431FC690B7EF879FFDDBAD9D3784A5869C6D8039B249D6B028181009A9EF0540FE4DD7C2EBE2657A5512516BFE2CEF4EA5B7FE4642F8CB145D4AADD093365C8E480BB7ADCB7E34546C29255C4E9B8B5B1258A7DA1461FE13F84ADE5CF59B30C41BDF27CA03A819624B52A7B8365FBD97236964B31BF5FF1751349B6CF32B2DD0CDB0CAFE18A243E2F390BDEA9D0EF8DDCC2DB5491695BF0725CD8A50281802101306917DC2DAA57D13DD131969FF67557358AFAD8B4F196DED9051C1B6E4DFBD48ECE402209FE48D2F7216F63A16E17040D9AE763F9C6271A484A0BBED51DB8C7048E03447C970A99383E7982E4948B6C034D6072F88018CD5198E08BEE006902CF04D40B8F3B65AD3546F3E7B1D8D6B5CC13604849CAC0F3C0C7FFB6A175028180616C870F1920FD24DEBE793A273591CB3E858962A9A93022AF36FB15CEF57F3C3EE101F1A8AF206DF757EC7A7EBD99D7E1C5B18870EB8B66E78F3FA005E4431D71B25F350103C2E68BC4474DF3BDAC57F8D9327304C65E5069DDB25C178615D1A3B264B22B8826E33D21F4CD50433FD6210ED5699741FB219E75F6DD8F5DB714''')):
-    if isinstance(msg,str):
-        msg=msg.encode()
-    prik=RSA.import_key(pri_data)
+def cmd_extract(args):
+    data = Path(args.dll).read_bytes()
+    der = bn_patch.extract_pubkey_der(data)
+    key = RSA.import_key(der[:294])
+    n_bytes = key.n.to_bytes((key.size_in_bits() + 7) // 8, "big")
+    print(f"DLL:       {args.dll}")
+    print(f"位长:      {key.size_in_bits()} bit (e=0x{key.e:X})")
+    print(f"N (hex):   {n_bytes.hex()}")
+    if args.out:
+        Path(args.out).write_bytes(der[:294])
+        print(f"DER 已写入: {args.out}")
+    return 0
 
-    sig=pkcs1_15.new(prik)
-    signature=sig.sign(SHA256.new(msg))
-    ret=base64.standard_b64encode(signature)
-    return ret
-def kg(count:int,email:str,serial_hexstr:str=random.randbytes(0x10).hex()):
-    lic={}
-    lic["product"]= "Binary Ninja Personal"
-    lic["email"]= email
-    lic["serial"]= serial_hexstr
-    lic["created"]=get_time_str()
-    lic["type"]= "User"
-    lic["count"]=count
-    lic["data"]=gen_licdata().decode()
-    msg='\x00'.join((lic["product"],lic["email"],lic["serial"],lic["created"],lic["type"],str(lic["count"]),lic["data"]))
-    lic["signature"]= gen_signature(msg).decode()
-    
-    s=json.dumps(lic,indent=0)
-    lic_text='[\n%s\n]'%s
-    return lic_text
 
-def build_pattern_instructions():
-    pattern_instrs = []
-    pattern_instrs.append([0xC7, 0x00, None, None, None, None])
+def cmd_genkey(args):
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    priv, pub = bn_rsa.generate_keypair(KEY_BITS)
+    priv_path = out_dir / "rsa_private.pem"
+    pub_path = out_dir / "rsa_public.pem"
+    priv_path.write_text(priv.export_key().decode())
+    pub_path.write_text(pub.export_key().decode())
+    print(f"私钥: {priv_path}")
+    print(f"公钥: {pub_path}")
+    return 0
 
-    offset = 0x04
-    while offset <= 0x7C:
-        pattern_instrs.append([0xC7, 0x40, offset, None, None, None, None])
-        offset += 4
 
-    offset = 0x80
-    while offset <= 0xFC:
-        pattern_instrs.append([0xC7, 0x80, offset, 0x00, 0x00, 0x00,
-                               None, None, None, None])
-        offset += 4
+def cmd_patch(args):
+    pub_data = Path(args.key).read_bytes()
+    key = RSA.import_key(pub_data)
+    if key.size_in_bits() != KEY_BITS:
+        print(f"警告: 密钥位长 {key.size_in_bits()}，目标版本为 {KEY_BITS}", file=sys.stderr)
+    der = bn_rsa.public_key_to_der(key)
+    if len(der) + 2 > 0x128:
+        raise ValueError(f"公钥 DER 过长: {len(der)} 字节 > 存储区 {0x128 - 2} 字节")
+    loc = bn_patch.patch_pubkey(args.dll, der, backup=not args.no_backup)
+    # 验证写回
+    data = Path(args.dll).read_bytes()
+    back = bn_patch.extract_pubkey_der(data)
+    ok = back[: len(der)] == der
+    n_bytes = key.n.to_bytes(256, "big")
+    print(f"模式起始:  0x{loc.start_offset:X}")
+    print(f"XOR 密钥:  0x{loc.xor_key:08X}")
+    print(f"写入字节:  {loc.length}")
+    print(f"新 N:      {n_bytes.hex()}")
+    print(f"写回校验:  {'通过' if ok else '失败!'}")
+    print("下一步: 用同一私钥生成 license 并放入安装目录")
+    return 0 if ok else 1
 
-    while offset <= 0x124:
-        offset_temp = offset - 0x100
-        pattern_instrs.append([0xC7, 0x80, offset_temp, 0x01, 0x00, 0x00,
-                               None, None, None, None])
-        offset += 4
 
-    return pattern_instrs
+def cmd_restore(args):
+    backup = bn_patch.restore_pubkey(args.dll)
+    print(f"已从 {backup} 恢复 {args.dll}")
+    return 0
 
-def find_xor_key(binary, end_offset, search_bytes=100):
-    i = end_offset
-    max_offset = min(len(binary), i + search_bytes)
 
-    while i < max_offset - 5:  # xor reg, imm32 is 6 bytes
-        opcode = binary[i]
-        modrm = binary[i + 1]
-        
-        if opcode == 0x35 and (modrm >> 3) & 7 == 6:
-            imm_bytes = binary[i + 1:i + 5]
-            xor_key = int.from_bytes(imm_bytes, "little")
-            return xor_key
-        elif opcode == 0x81 and (modrm >> 3) & 7 == 6:
-            imm_bytes = binary[i + 2:i + 6]
-            xor_key = int.from_bytes(imm_bytes, "little")
-            return xor_key
-        i += 1
-    return None
+def cmd_license(args):
+    key_data = Path(args.key).read_bytes()
+    priv = RSA.import_key(key_data)
+    text = bn_rsa.generate_license(
+        email=args.email,
+        count=args.count,
+        serial_hexstr=args.serial,
+        product=args.product,
+        lic_type=args.type,
+        private_key=priv,
+    )
+    out = args.out or "license.dat"
+    Path(out).write_text(text, encoding="utf-8")
+    print(f"license 已生成: {out}")
+    return 0
 
-def find_xor_key_backup(binary, end_offset, search_bytes=150):
-    i = end_offset
-    max_offset = min(len(binary), i + search_bytes)
-    reg_map = {}
 
-    while i < max_offset - 5:
-        opcode = binary[i]
+def cmd_verify(args):
+    der = bn_patch.extract_pubkey_der(Path(args.dll).read_bytes())
+    key = RSA.import_key(der[:294])
+    n_hex = key.n.to_bytes(256, "big").hex()
+    priv_data = Path(args.key).read_bytes()
+    priv = RSA.import_key(priv_data)
+    match = key.n == priv.n
+    print(f"DLL 中 N:    {n_hex}")
+    print(f"私钥匹配:    {'是' if match else '否'}")
+    if args.license:
+        lic = bn_rsa.license_from_text(Path(args.license).read_text(encoding="utf-8"))
+        from Crypto.Signature import pkcs1_15
+        import base64
 
-        if opcode == 0x35 and (modrm >> 3) & 7 == 6:
-            imm_bytes = binary[i + 1:i + 5]
-            xor_key = int.from_bytes(imm_bytes, "little")
-            if xor_key is not None:
-                return xor_key
+        ok = bn_rsa.verify_license(
+            lic, key, base64.b64decode(lic["signature"])
+        )
+        print(f"license 验签: {'通过' if ok else '失败'}")
+    return 0 if match else 1
 
-        if 0xB8 <= opcode <= 0xBF:
-            reg = opcode - 0xB8
-            imm_bytes = binary[i + 1:i + 5]
-            imm_value = int.from_bytes(imm_bytes, "little")
-            reg_map[reg] = imm_value
-            i += 5
-            continue
 
-        if opcode == 0x81:
-            modrm = binary[i + 1]
-            if (modrm >> 3) & 7 == 6:
-                imm_bytes = binary[i + 2:i + 6]
-                xor_key = int.from_bytes(imm_bytes, "little")
-                if xor_key is not None:
-                    return xor_key
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="keygen",
+        description="Binary Ninja 授权生成器（需要修改 RSA N）",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
-        if opcode == 0x31:
-            modrm = binary[i + 1]
-            reg_dest = modrm & 7
-            reg_src = (modrm >> 3) & 7
-            if reg_src in reg_map:
-                xor_key = reg_map[reg_src]
-                if xor_key is not None:
-                    return xor_key
-        i += 1
-    return None
+    p = sub.add_parser("extract", help="提取 DLL 中当前公钥 N")
+    p.add_argument("dll", help="binaryninjacore.dll 路径")
+    p.add_argument("--out", help="输出 DER 到文件")
+    p.set_defaults(func=cmd_extract)
 
-def search_pattern_operand_locations(binary, pattern_instrs, max_gap):
-    n = len(binary)
-    first_instr = pattern_instrs[0]
-    plen = len(first_instr)
+    p = sub.add_parser("genkey", help="生成新 RSA 密钥对")
+    p.add_argument("--out-dir", default=".", help="输出目录（默认当前目录）")
+    p.set_defaults(func=cmd_genkey)
 
-    i = 0
-    while i <= n - plen:
-        operand_locations = []
-        match = True
+    p = sub.add_parser("patch", help="用公钥替换 DLL 中 N")
+    p.add_argument("dll", help="binaryninjacore.dll 路径")
+    p.add_argument("--key", required=True, help="公钥 PEM 文件")
+    p.add_argument("--no-backup", action="store_true", help="不备份 .bak")
+    p.set_defaults(func=cmd_patch)
 
-        instr_locs = []
-        for j in range(plen):
-            if first_instr[j] is None:
-                instr_locs.append(i + j)
-            else:
-                if binary[i + j] != first_instr[j]:
-                    match = False
-                    break
+    p = sub.add_parser("restore", help="从 .bak 恢复原版 DLL")
+    p.add_argument("dll", help="binaryninjacore.dll 路径")
+    p.set_defaults(func=cmd_restore)
 
-        if not match:
-            i += 1
-            continue
+    p = sub.add_parser("license", help="生成 license.dat")
+    p.add_argument("--key", required=True, help="私钥 PEM 文件")
+    p.add_argument("--email", default="hi@binja.com", help="邮箱")
+    p.add_argument("--count", type=int, default=32, help="授权数量")
+    p.add_argument("--serial", help="序列号（hex，默认随机）")
+    p.add_argument("--product", default="Binary Ninja Personal", help="产品名")
+    p.add_argument("--type", default="User", help="许可类型")
+    p.add_argument("--out", help="输出文件（默认 license.dat）")
+    p.set_defaults(func=cmd_license)
 
-        operand_locations.append(instr_locs)
-        last_pos = i
+    p = sub.add_parser("verify", help="校验 DLL 中 N 与私钥匹配")
+    p.add_argument("dll", help="binaryninjacore.dll 路径")
+    p.add_argument("--key", required=True, help="私钥 PEM 文件")
+    p.add_argument("--license", help="license.dat 路径（可选，额外验签）")
+    p.set_defaults(func=cmd_verify)
 
-        for instr in pattern_instrs[1:]:
-            instr_len = len(instr)
-            found = False
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 1
 
-            search_limit = min(last_pos + 1 + max_gap, n - instr_len + 1)
 
-            for k in range(last_pos + 1, search_limit):
-                sub_match = True
-                instr_locs = []
-
-                for l in range(instr_len):
-                    if instr[l] is None:
-                        instr_locs.append(k + l)
-                    else:
-                        if binary[k + l] != instr[l]:
-                            sub_match = False
-                            break
-
-                if sub_match:
-                    operand_locations.append(instr_locs)
-                    last_pos = k
-                    found = True
-                    break
-
-            if not found:
-                match = False
-                break
-
-        if match:
-            return i, operand_locations
-
-        i += 1
-
-    return None, None
-
-def transform(table, length, xor_key):
-    dst = bytearray(length)
-    p = 0
-
-    for i in range(length):
-        rax = i >> 2
-        edx = table[rax] ^ xor_key
-        shift = (i & 3) << 3
-        byte = (edx >> shift) & 0xFF
-
-        dst[p] = byte
-        p += 1
-
-    return bytes(dst)
-
-if __name__ == '__main__':
-    files = [
-        "libbinaryninjacore.so.1",
-        "libbinaryninjacore.1.dylib",
-        "binaryninjacore.dll"
-    ]
-    for filename in files:
-        try:
-            with open(filename, "r+b") as f:
-                data = f.read()
-
-                pattern_instrs = build_pattern_instructions()
-
-                offset, operand_locations = search_pattern_operand_locations(data, pattern_instrs, max_gap=32) # add more if pattern not found
-
-                if offset is None:
-                    print("Pattern not found.")
-                    exit()
-
-                all_offsets = [loc for group in operand_locations for loc in group]
-                print("Total operand byte positions:", len(all_offsets))
-
-                end_of_pattern = max(max(group) for group in operand_locations) + 1
-                xor_key = find_xor_key(data, end_of_pattern)
-                if xor_key is None:
-                    xor_key = find_xor_key_backup(data, end_of_pattern)
-                print(hex(xor_key))
-                pub_data=bytes.fromhex('''30820122300D06092A864886F70D01010105000382010F003082010A0282010100D2BF8069B298618B54272B13CE402C37826D906FA0DB47C916E304D61CFE847306AD1763A332A6FACBEF133DE5E634B333739EFFFE9F7513F7C38CDF4EB7CE27B56B728424F9410DB4CD3AB33D2A367123470D62324211876D83C15B59FB7A4D5A74E56F9E443DBEFF30289D3E4F84E58E6AB23AD4F43870034605E68EDF1FF90256AA027C6102981B8A7742C3DCFC536A4D98C4E22702F2BFFDE2985E232A2446D5750E20EDD27E59FA2475CFF2882CA33347209F62DED6965D85B03BDE6E02B99F680F33B7DC08F8730C0BCE62256FCA5613213A1182C00A36A9D496629D15C1B604550F97388C2DFD60CC8DC15CF5D61A829167CE07F9798168C92D6037470203010001''')
-                table = [int.from_bytes(pub_data[i:i+4], "little") for i in range(0, len(pub_data), 4)]
-                length = 0x128
-
-                xored_pubkey_modded = transform(table, length, xor_key)
-
-                if len(xored_pubkey_modded) != len(all_offsets):
-                    raise ValueError("Transformed key length does not match operand count!")
-
-                for idx, file_offset in enumerate(all_offsets):
-                    f.seek(file_offset)
-                    f.write(bytes([xored_pubkey_modded[idx]]))
-
-            # generate license, thank you DirWang https://www.cnblogs.com/DirWang/p/19016924
-            lic_path='license.dat' 
-            count=32
-            email="hi@binja.com"
-            text=kg(count,email)
-            with open(lic_path,'w',encoding='utf8') as f:
-                f.write(text)
-            print("Patched and made license for " + filename)
-        except FileNotFoundError as e:
-            print(filename + " not found, skipping.")
-        except PermissionError as e:
-            print("No permisions to edit/open " + filename)
+if __name__ == "__main__":
+    sys.exit(main())
