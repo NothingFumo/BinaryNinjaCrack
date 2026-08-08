@@ -35,10 +35,11 @@ keygen.py
 │   ├── generate_keypair()             生成 RSA-2048
 │   ├── generate_license()             构造 7 字段 + SHA256 + PKCS1v1.5 签名
 │   └── verify_license()               验签
-└── 模块 C      CLI（扁平参数，对齐 exe-patch）
-    └── main()                         --dll / --restore / --dry-run /
-                                       --extract / --verify / --work-dir /
-                                       --license-dir / --email / --count
+└── 模块 C      CLI（扁平参数，对齐 exe-patch / deploy.py）
+    ├── resolve_dll()     位置参数：目录 → 目录/DLL；文件 → 直接用；无 → 自动查找
+    └── main()            target / --dll / --restore / --dry-run /
+                           --extract / --verify / --work-dir /
+                           --license-dir / --email / --count
 ```
 
 ## 3. 关键算法
@@ -61,12 +62,12 @@ data = base64(0x100 随机 + RC4(MD5(随机), 8B magic))
 ### 3.3 一键流程
 
 ```
---dll 缺省 → 当前目录/脚本目录查找 binaryninjacore.dll
+目标解析：位置参数（目录/DLL）或 --dll，缺省 → 当前目录/脚本目录查找
 工作目录无私钥 → 生成 rsa_private.pem / rsa_public.pem
 定位模式 + XOR 密钥 → 打印 当前N / 新N
 dry-run? → 结束
 patch：备份 .bak → 编码新 DER → 写回 296 字节 → 重新提取对比（自校验）
-license：签发 license.dat 到 --license-dir（默认 DLL 目录）
+license：签发 license.dat 到 --license-dir（默认 DLL 所在目录 = 安装目录）
 ```
 
 ## 4. 验证

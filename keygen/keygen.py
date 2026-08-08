@@ -5,11 +5,16 @@
 使用说明：仅供测试、需要修改 RSA N —— 必须将 DLL 中内嵌的原版
 公钥 N 替换为自定义密钥对的公钥 N，license 才能验签通过。
 
-用法（与 exe-patch 风格一致）:
+用法（与 exe-patch / deploy.py 风格一致）:
   cd keygen
-  python keygen.py --dll "D:\\BinaryNinja\\binaryninjacore.dll"
-  python keygen.py --dll "D:\\BinaryNinja\\binaryninjacore.dll" --restore  # 恢复
-  python keygen.py --dll "D:\\BinaryNinja\\binaryninjacore.dll" --dry-run  # 仅分析
+  python keygen.py D:\\BinaryNinja                # 部署：一键 生成密钥→patch→license
+  python keygen.py D:\\BinaryNinja --restore     # 恢复
+  python keygen.py D:\\BinaryNinja --dry-run     # 仅分析
+
+  # 将 keygen.py 放入安装目录后直接运行：
+  cd D:\\BinaryNinja
+  python keygen.py                               # 自动查找当前目录 DLL
+  python keygen.py --restore                     # 恢复
 
 一键流程（默认）:
   1. 生成 RSA-2048 密钥对（已存在则复用，存放于工作目录）
@@ -333,8 +338,27 @@ def find_default_dll() -> Path:
         if cand.exists():
             return cand
     raise FileNotFoundError(
-        "未找到 binaryninjacore.dll，请用 --dll 指定安装目录中的文件"
+        "未找到 binaryninjacore.dll，请指定安装目录（如 python keygen.py D:/BinaryNinja）"
     )
+
+
+def resolve_dll(target: str = None) -> Path:
+    """解析目标为 binaryninjacore.dll 路径。
+
+    支持三种方式：
+      1. 位置参数指定安装目录（如 D:/BinaryNinja）
+      2. 位置参数直接指定 DLL 文件
+      3. 无参数：自动查找当前目录 / 脚本目录
+    """
+    if target:
+        p = Path(target)
+        if p.is_dir():
+            cand = p / "binaryninjacore.dll"
+            if not cand.exists():
+                raise FileNotFoundError(f"目录中未找到 {cand}")
+            return cand
+        return p
+    return find_default_dll()
 
 
 def main():
@@ -342,7 +366,9 @@ def main():
         prog="keygen",
         description="Binary Ninja 授权生成器（单文件，需要修改 RSA N）",
     )
-    ap.add_argument("--dll", default=None, help="binaryninjacore.dll 路径（默认自动查找）")
+    ap.add_argument("target", nargs="?", default=None,
+                    help="Binary Ninja 安装目录或 binaryninjacore.dll 路径（省略时自动查找）")
+    ap.add_argument("--dll", default=None, help="binaryninjacore.dll 路径（与位置参数等价）")
     ap.add_argument("--work-dir", default=str(default_workdir()),
                     help="工作目录（密钥存放，默认脚本所在目录）")
     ap.add_argument("--license-dir", default=None,
@@ -358,7 +384,7 @@ def main():
     args = ap.parse_args()
 
     try:
-        dll = Path(args.dll) if args.dll else find_default_dll()
+        dll = resolve_dll(args.target or args.dll)
 
         if args.restore:
             backup = restore_pubkey(dll)

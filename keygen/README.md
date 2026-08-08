@@ -16,27 +16,29 @@ Binary Ninja 用 RSA-2048 验签 license.dat（SHA-256 + PKCS#1 v1.5）。公钥
 ```bash
 cd keygen
 
-# 一键：生成密钥 → 替换 DLL 中 N → 生成 license.dat（默认输出到 DLL 所在目录）
-python keygen.py --dll "D:\BinaryNinja\binaryninjacore.dll"
+# 方式一：指定 Binary Ninja 安装目录（部署）
+python keygen.py D:\BinaryNinja
+python keygen.py D:\BinaryNinja --restore   # 恢复
 
-# 恢复：从自动备份的 .bak 还原原版 DLL
-python keygen.py --dll "D:\BinaryNinja\binaryninjacore.dll" --restore
+# 方式二：将 keygen.py 放入安装目录后直接运行
+cd D:\BinaryNinja
+python keygen.py
+python keygen.py --restore
 
-# 仅分析：查看当前 N 与补丁位置，不写入
-python keygen.py --dll "D:\BinaryNinja\binaryninjacore.dll" --dry-run
-
-# 提取当前 N
-python keygen.py --dll "D:\BinaryNinja\binaryninjacore.dll" --extract
-
-# 校验 DLL 中 N 与工作目录私钥是否匹配
-python keygen.py --dll "D:\BinaryNinja\binaryninjacore.dll" --verify
+# 仅分析 / 提取 / 校验
+python keygen.py D:\BinaryNinja --dry-run   # 仅查看定位与 N，不写入
+python keygen.py D:\BinaryNinja --extract   # 提取当前 N
+python keygen.py D:\BinaryNinja --verify    # 校验 DLL 中 N 与私钥匹配
 ```
+
+位置参数可指定安装目录或 `binaryninjacore.dll` 文件本身；省略时自动查找当前目录 / 脚本目录。
 
 ## 参数
 
 | 参数 | 说明 |
 |------|------|
-| `--dll` | binaryninjacore.dll 路径（省略时自动查找当前目录/脚本目录） |
+| `target`（位置参数） | 安装目录或 DLL 路径（省略时自动查找当前目录/脚本目录） |
+| `--dll` | DLL 路径（与位置参数等价） |
 | `--work-dir` | 工作目录（密钥存放，**默认脚本所在目录**） |
 | `--license-dir` | license 输出目录（默认 DLL 所在目录） |
 | `--restore` | 从 `.bak` 恢复原版 DLL |
