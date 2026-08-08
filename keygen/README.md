@@ -1,51 +1,54 @@
-# RSA 注册机
+# RSA 注册机（Binary Ninja 授权生成器）
 
-生成 RSA 密钥对 + license.dat，用于配合 RSA 公钥替换方案。
+> 适用版本：v5.3.9434，其它版本自测
+> 使用说明：仅供测试、需要修改 RSA N
+
+重新实现后的模块化 keygen：生成密钥对 → 替换 `binaryninjacore.dll` 中内嵌的 RSA 公钥 N → 用私钥签发 `license.dat`。
 
 ## 原理
 
-Binary Ninja 使用 RSA 签名验证 license.dat：
-
-```
-license.dat 内容 → SHA256 哈希 → RSA 私钥签名 → 签名数据
-                                                    ↓
-程序读取 license.dat → RSA 公钥验签 → 通过/失败
-```
-
-通过替换 DLL 中的 RSA 公钥 N，用自定义私钥签名，即可通过验证。
+Binary Ninja 用 RSA-2048 验签 license.dat（SHA-256 + PKCS#1 v1.5）。公钥 N 以 XOR 编码的 SPKI DER（296 字节）内嵌在 DLL 的 C7 指令序列中。**需要修改 RSA N**：必须把 DLL 中的原版公钥替换为自定义密钥对的公钥，license 才能验签通过。详见 [`doc/rsa-keygen-analysis.md`](../doc/rsa-keygen-analysis.md)。
 
 ## 使用
 
+依赖：`pip install pycryptodome`
+
 ```bash
-pip install pycryptodome
-python keygen.py
+# 1. 生成密钥对
+python keygen.py genkey --out-dir keys
+
+# 2. 替换 DLL 中 RSA N（自动备份 .bak，可 restore 还原）
+python keygen.py patch "D:\BinaryNinja\binaryninjacore.dll" --key keys\rsa_public.pem
+
+# 3. 生成 license.dat（放入 Binary Ninja 安装目录）
+python keygen.py license --key keys\rsa_private.pem --email you@example.com --count 999
+
+# 4. 校验（可选）
+python keygen.py verify "D:\BinaryNinja\binaryninjacore.dll" --key keys\rsa_private.pem --license license.dat
 ```
 
-## 生成文件
+## 子命令
+
+| 命令 | 说明 |
+|------|------|
+| `extract <dll> [--out der]` | 提取 DLL 中当前公钥 N（hex/DER） |
+| `genkey [--out-dir .]` | 生成 RSA-2048 密钥对 |
+| `patch <dll> --key pub.pem` | 替换 DLL 中 N（自动备份 `.bak`，写回自校验） |
+| `restore <dll>` | 从 `.bak` 恢复原版 DLL |
+| `license --key priv.pem` | 生成 license.dat（`--email/--count/--serial/--product/--type`） |
+| `verify <dll> --key priv.pem` | 校验 DLL 中 N 与私钥匹配，可选验签 license |
+
+## 文件
 
 | 文件 | 说明 |
 |------|------|
-| `rsa_private.pem` | RSA 私钥（签名用） |
-| `rsa_public.pem` | RSA 公钥（验签用） |
-| `xor_key.bin` | XOR 编码密钥 |
-| `encoded_key.bin` | 编码后的 RSA N |
-| `license.dat` | 许可证文件 |
-
-## 配合 DLL 劫持使用
-
-```bash
-# 1. 生成密钥
-python keygen.py
-
-# 2. 补丁 binaryninjacore.dll 中的 RSA N
-python bn_keygen.py --patch
-
-# 3. 复制 license.dat 到安装目录
-cp license.dat "D:\BinaryNinja\"
-```
+| `keygen.py` | CLI 入口 |
+| `bn_rsa.py` | 密钥对生成、DER 编码、license 签发/验证 |
+| `bn_patch.py` | DLL 中 N 的定位（指令模式 + XOR 密钥）、提取、替换、备份/恢复 |
+| `DESIGN.md` | 重新实现方案设计 |
 
 ## 注意事项
 
-- 需要 `pycryptodome` 库：`pip install pycryptodome`
-- RSA 密钥长度默认 4096 位
-- 生成的 license.dat 需配合 RSA N 补丁使用
+- patch 前自动备份 `binaryninjacore.dll.bak`；重复 patch 不覆盖已有备份
+- 密钥文件与 `license.dat` 已被 `.gitignore` 排除，不入库
+- 版本升级后需重新提取 XOR 密钥（本实现动态定位，不硬编码偏移）
