@@ -390,6 +390,50 @@ def resolve_dll(target: str = None) -> Path:
     return find_default_dll()
 
 
+def hosts_path() -> Path:
+    return Path(r"C:\Windows\System32\drivers\etc\hosts")
+
+
+def block_update_server() -> int:
+    """屏蔽更新/认证服务器：hosts 将 api.binary.ninja 指向 127.0.0.1。
+
+    目的：keygen 的 license 只能通过本地验证（DLL 内公钥已替换），
+    更新检查用官方公钥验签必然失败（"Update authentication failed:
+    License not found"）。屏蔽后更新检查静默失败，不再弹错。
+    """
+    lines = [
+        "# Block Binary Ninja update/license auth (added by keygen)",
+        "0.0.0.0 api.binary.ninja",
+        "127.0.0.1 api.binary.ninja",
+    ]
+    hp = hosts_path()
+    content = hp.read_text(encoding="utf-8", errors="ignore")
+    if "api.binary.ninja" in content:
+        print("更新服务器已在屏蔽状态（hosts 中已存在 api.binary.ninja）")
+        return 0
+    with open(hp, "a", encoding="utf-8") as f:
+        f.write("\n" + "\n".join(lines) + "\n")
+    print("已屏蔽更新服务器: api.binary.ninja -> 127.0.0.1")
+    return 0
+
+
+def unblock_update_server() -> int:
+    """从 hosts 移除屏蔽条目，恢复更新检查。"""
+    hp = hosts_path()
+    content = hp.read_text(encoding="utf-8", errors="ignore")
+    if "api.binary.ninja" not in content:
+        print("未发现屏蔽条目（hosts 中无 api.binary.ninja）")
+        return 0
+    kept = [
+        ln for ln in content.splitlines()
+        if "api.binary.ninja" not in ln
+        and "Block Binary Ninja update" not in ln
+    ]
+    hp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    print("已取消屏蔽，更新服务器恢复")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="keygen",
@@ -410,9 +454,18 @@ def main():
     ap.add_argument("--count", type=int, default=DEFAULT_COUNT, help="license 授权数量")
     ap.add_argument("--serial", default=None, help="license 序列号（hex）")
     ap.add_argument("--no-backup", action="store_true", help="patch 前不备份 .bak")
+    ap.add_argument("--block-updates", action="store_true",
+                    help="屏蔽更新服务器（hosts 添加 api.binary.ninja，避免 license 认证报错）")
+    ap.add_argument("--unblock-updates", action="store_true",
+                    help="取消屏蔽更新服务器（从 hosts 移除）")
     args = ap.parse_args()
 
     try:
+        if args.block_updates:
+            return block_update_server()
+        if args.unblock_updates:
+            return unblock_update_server()
+
         dll = resolve_dll(args.target or args.dll)
 
         if args.restore:

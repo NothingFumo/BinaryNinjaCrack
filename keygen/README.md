@@ -29,6 +29,8 @@ python keygen.py --restore
 python keygen.py D:\BinaryNinja --dry-run   # 仅查看定位与 N，不写入
 python keygen.py D:\BinaryNinja --extract   # 提取当前 N
 python keygen.py D:\BinaryNinja --verify    # 校验 DLL 中 N 与私钥匹配
+python keygen.py --block-updates            # 屏蔽更新服务器（避免认证报错）
+python keygen.py --unblock-updates          # 恢复更新
 ```
 
 位置参数可指定安装目录或 `binaryninjacore.dll` 文件本身；省略时自动查找当前目录 / 脚本目录。
@@ -47,6 +49,7 @@ python keygen.py D:\BinaryNinja --verify    # 校验 DLL 中 N 与私钥匹配
 | `--verify` | 校验 DLL 中 N 与工作目录私钥匹配 |
 | `--email` / `--count` / `--serial` | license 内容定制 |
 | `--no-backup` | patch 前不备份 `.bak` |
+| `--block-updates` / `--unblock-updates` | 屏蔽/恢复更新服务器（hosts 操作） |
 
 ## 生成文件
 
