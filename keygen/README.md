@@ -35,6 +35,24 @@ python keygen.py --unblock-updates          # 恢复更新
 
 位置参数可指定安装目录或 `binaryninjacore.dll` 文件本身；省略时自动查找当前目录 / 脚本目录。
 
+## Headless / MCP 方案（无需修改 DLL）
+
+v5.3.9434 的 headless/API 模式走真实验签（EMS A3(SHA-256) 对象序列化），
+keygen 无法伪造验签消息。改用**内存 patch** 绕过：
+
+```python
+# 在 import binaryninja 之后、使用 API 之前
+from bn_license_hook import apply_license_hook
+apply_license_hook()
+```
+
+原理：license_init 中 6 处"失败跳转 throw"全部 NOP，使失败分支自然落入
+成功路径（设置验证标志），BN 即认为 license 有效。仅修改内存，不改 DLL。
+已集成到 `binary-ninja-headless-mcp` 的 `load_binja_module()`（自动生效）。
+
+验证结果：`BNIsLicenseValidated=True`，headless 加载 PE 成功（82113 函数），
+MCP `open_session` 完整可用。详见 [`LICENSE_FORMAT_NOTES.md`](LICENSE_FORMAT_NOTES.md)。
+
 ## 参数
 
 | 参数 | 说明 |
