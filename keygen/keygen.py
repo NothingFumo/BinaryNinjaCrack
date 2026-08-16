@@ -204,7 +204,13 @@ def extract_pubkey_der(binary: bytes) -> bytes:
 
 
 def patch_pubkey(dll_path, pubkey_der: bytes, backup: bool = True) -> PubkeyLocation:
-    """将新公钥 DER 写入 DLL 的 N 存储区。"""
+    """将新公钥 DER 写入 DLL 的 N 存储区。
+
+    若 DLL 被进程占用（共享冲突，如 headless MCP 加载），自动将原文件
+    重命名为 <dll>.locked（占用进程继续持有旧句柄），再从内存写回新文件。
+    """
+    import os
+
     dll = Path(dll_path)
     if backup:
         backup_path = dll.with_suffix(dll.suffix + ".bak")
@@ -219,17 +225,40 @@ def patch_pubkey(dll_path, pubkey_der: bytes, backup: bool = True) -> PubkeyLoca
     encoded = xor_encode_pubkey(pubkey_der, loc.length, loc.xor_key)
     for off, byte in zip(loc.operand_offsets, encoded):
         data[off] = byte
-    dll.write_bytes(bytes(data))
+    try:
+        dll.write_bytes(bytes(data))
+    except PermissionError:
+        locked = dll.with_name(dll.name + ".locked")
+        if locked.exists():
+            raise PermissionError(
+                f"DLL 被进程占用且 {locked.name} 已存在，请手动处理"
+            )
+        os.rename(dll, locked)
+        dll.write_bytes(bytes(data))
+        print(f"提示: DLL 被进程占用，原文件已重命名为 {locked.name}")
     return loc
 
 
 def restore_pubkey(dll_path) -> Path:
-    """从 .bak 恢复原版 DLL。"""
+    """从 .bak 恢复原版 DLL（被占用时自动重命名替换）。"""
+    import os
+
     dll = Path(dll_path)
     backup = dll.with_suffix(dll.suffix + ".bak")
     if not backup.exists():
         raise FileNotFoundError(f"备份文件不存在：{backup}")
-    dll.write_bytes(backup.read_bytes())
+    data = backup.read_bytes()
+    try:
+        dll.write_bytes(data)
+    except PermissionError:
+        locked = dll.with_name(dll.name + ".locked")
+        if locked.exists():
+            raise PermissionError(
+                f"DLL 被进程占用且 {locked.name} 已存在，请手动处理"
+            )
+        os.rename(dll, locked)
+        dll.write_bytes(data)
+        print(f"提示: DLL 被进程占用，原文件已重命名为 {locked.name}")
     return backup
 
 
