@@ -10,10 +10,17 @@ Binary Ninja EXE 通用许可证绕过补丁 (v2)
   3. 从 LEA 向前搜索 test al,al + JNE
   4. 将 JNE 替换为 JMP + NOP
 
-用法:
-  python patch_universal.py --exe path/to/binaryninja.exe
-  python patch_universal.py --exe path/to/binaryninja.exe --restore
-  python patch_universal.py --exe path/to/binaryninja.exe --dry-run
+用法（方式一：指定路径 / 方式二：脚本放入安装目录）:
+  python patch_universal.py D:\\BinaryNinja            # 部署（指定安装目录）
+  python patch_universal.py D:\\BinaryNinja\\binaryninja.exe  # 部署（指定 exe）
+  python patch_universal.py D:\\BinaryNinja --restore  # 恢复
+
+  cd D:\\BinaryNinja
+  python patch_universal.py                            # 部署（自动探测）
+  python patch_universal.py --restore                  # 恢复
+
+  python patch_universal.py --dry-run                  # 仅分析，不写入
+  兼容旧参数: --exe path/to/binaryninja.exe
 """
 
 import struct, shutil, os, sys, argparse
@@ -131,16 +138,29 @@ def find_lea_refs_to_va(pe, target_va, search_section='.text'):
 # ── JNE 定位 ─────────────────────────────────────────────────────────────────
 
 def find_test_jne_before(pe, anchor_off, max_back=128):
-    """从 anchor_off 向前搜索 84 C0 0F 85 (test al,al; JNE)。"""
+    """从 anchor_off 向前搜索 84 C0 0F 85 (test al,al; JNE)。
+
+    返回 (jne_off, jne_disp, dist)；若 JNE 已被补丁为 E9..90 则返回
+    ('patched', None, None)。
+    """
+    patched_off = None
     for i in range(max_back):
         off = anchor_off - i
         if off < 0 or off + 8 > len(pe.data):
             break
         if pe.data[off] == 0x84 and pe.data[off + 1] == 0xC0:
+            if patched_off is None:
+                # test al,al 后紧跟 E9 xx xx xx xx 90 → 已补丁（JMP+NOP）
+                if (pe.data[off + 2] == 0xE9
+                        and off + 7 < len(pe.data)
+                        and pe.data[off + 7] == 0x90):
+                    patched_off = off
             if pe.data[off + 2] == 0x0F and pe.data[off + 3] == 0x85:
                 jne_off = off + 2
                 jne_disp = struct.unpack_from('<i', pe.data, off + 4)[0]
                 return jne_off, jne_disp, anchor_off - off
+    if patched_off is not None:
+        return 'patched', None, None
     return None, None, None
 
 
@@ -169,14 +189,35 @@ ANCHOR_STRINGS = [
 
 def main():
     ap = argparse.ArgumentParser(description='Binary Ninja EXE 通用许可证绕过补丁')
-    ap.add_argument('--exe', required=True, help='binaryninja.exe 路径')
+    ap.add_argument('target', nargs='?', default=None,
+                    help='Binary Ninja 安装目录或 binaryninja.exe 路径（省略时自动查找）')
+    ap.add_argument('--exe', default=None, help='binaryninja.exe 路径（兼容旧参数）')
     ap.add_argument('--restore', action='store_true', help='从备份恢复')
     ap.add_argument('--dry-run', action='store_true', help='仅分析，不写入')
     args = ap.parse_args()
 
-    exe_path = args.exe
-    if not os.path.exists(exe_path):
-        print(f'[ERROR] 文件不存在: {exe_path}')
+    # ── 解析目标：位置参数 > --exe > 自动探测 ──
+    exe_path = args.target or args.exe
+    if exe_path:
+        if os.path.isdir(exe_path):
+            exe_path = os.path.join(exe_path, 'binaryninja.exe')
+    else:
+        # 放入安装目录直接运行：探测当前目录 / 脚本目录 / 父目录
+        candidates = []
+        here = os.path.dirname(os.path.abspath(__file__))
+        for base in (os.getcwd(), here, os.path.dirname(here)):
+            p = os.path.join(base, 'binaryninja.exe')
+            if os.path.exists(p):
+                candidates.append(p)
+        if len(set(candidates)) > 1:
+            print(f'[ERROR] 找到多个 binaryninja.exe，请指定路径')
+            for c in sorted(set(candidates)):
+                print(f'  {c}')
+            return 1
+        exe_path = candidates[0] if candidates else None
+
+    if not exe_path or not os.path.exists(exe_path):
+        print(f'[ERROR] 未找到 binaryninja.exe（可传入安装目录或 exe 路径）')
         return 1
 
     print('=' * 55)
@@ -223,6 +264,17 @@ def main():
         for lea_off in lea_offs:
             # 从 LEA 向前搜索 test al,al + JNE
             jne_off, jne_disp, dist = find_test_jne_before(pe, lea_off)
+            if jne_off == 'patched':
+                best = {
+                    'term': term,
+                    'str_off': str_off,
+                    'lea_off': lea_off,
+                    'jne_off': None,
+                    'jne_disp': None,
+                    'lea_to_jne': dist,
+                    'patched': True,
+                }
+                break
             if jne_off is not None and jne_disp > 0x100:
                 best = {
                     'term': term,
@@ -231,6 +283,7 @@ def main():
                     'jne_off': jne_off,
                     'jne_disp': jne_disp,
                     'lea_to_jne': dist,
+                    'patched': False,
                 }
                 break
         if best:
@@ -241,6 +294,11 @@ def main():
         print('  尝试过的锚点: ' + ', '.join(f'"{t}"' for t in ANCHOR_STRINGS))
         print('  此版本可能不兼容通用补丁方案')
         return 1
+
+    if best.get('patched'):
+        print(f'  锚点字符串: "{best["term"]}"')
+        print(f'  [SKIP] 已经补丁过（JNE 已变为 JMP+NOP）')
+        return 0
 
     jne_rva = pe.offset_to_rva(best['jne_off'])
     print(f'  锚点字符串: "{best["term"]}"')

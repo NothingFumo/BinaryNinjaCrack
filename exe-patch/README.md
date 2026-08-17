@@ -34,15 +34,30 @@
 
 ## 使用
 
+### 方式一：指定 Binary Ninja 路径
+
 ```bash
-# 分析（不写入）
-python patch_universal.py --exe "D:\BinaryNinja\binaryninja.exe" --dry-run
+python patch_universal.py D:\BinaryNinja            # 部署（指定安装目录）
+python patch_universal.py D:\BinaryNinja --restore  # 恢复
+# 也可直接指定 exe：
+python patch_universal.py D:\BinaryNinja\binaryninja.exe
+```
 
-# 补丁
-python patch_universal.py --exe "D:\BinaryNinja\binaryninja.exe"
+### 方式二：将脚本放入 Binary Ninja 目录
 
-# 恢复
-python patch_universal.py --exe "D:\BinaryNinja\binaryninja.exe" --restore
+将 `patch_universal.py` 复制到 Binary Ninja 安装目录，直接运行：
+
+```bash
+cd D:\BinaryNinja
+python patch_universal.py            # 部署（自动查找当前目录）
+python patch_universal.py --restore  # 恢复
+```
+
+### 类似的使用
+
+```bash
+python patch_universal.py --dry-run   # 仅分析，不写入
+python patch_universal.py --exe D:\BinaryNinja\binaryninja.exe  # 兼容旧参数
 ```
 
 ## 锚点字符串列表
