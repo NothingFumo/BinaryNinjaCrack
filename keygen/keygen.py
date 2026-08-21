@@ -203,14 +203,35 @@ def extract_pubkey_der(binary: bytes) -> bytes:
     return xor_decode_pubkey(encoded, loc.xor_key)[:294]
 
 
+def _replace_occupied(dll: Path, write_data: bytes) -> None:
+    """DLL 被进程占用时的替换写回。
+
+    将原文件重命名为 <dll>.locked（占用进程继续持有旧句柄），再写入新内容。
+    自动清理上一次部署遗留的 .locked 残留（若已被释放）；若残留仍被占用
+    （无法删除），则给出明确指引。
+    """
+    import os
+
+    locked = dll.with_name(dll.name + ".locked")
+    try:
+        if locked.exists():
+            locked.unlink()  # 清理上次部署残留（进程已退出、句柄已释放）
+    except PermissionError:
+        raise PermissionError(
+            f"DLL 与 {locked.name} 均被进程占用，无法替换；"
+            f"请先停止占用进程（headless MCP / Binary Ninja GUI）后重试"
+        )
+    os.rename(dll, locked)
+    dll.write_bytes(write_data)
+    print(f"提示: DLL 被进程占用，原文件已重命名为 {locked.name}")
+
+
 def patch_pubkey(dll_path, pubkey_der: bytes, backup: bool = True) -> PubkeyLocation:
     """将新公钥 DER 写入 DLL 的 N 存储区。
 
     若 DLL 被进程占用（共享冲突，如 headless MCP 加载），自动将原文件
     重命名为 <dll>.locked（占用进程继续持有旧句柄），再从内存写回新文件。
     """
-    import os
-
     dll = Path(dll_path)
     if backup:
         backup_path = dll.with_suffix(dll.suffix + ".bak")
@@ -228,21 +249,12 @@ def patch_pubkey(dll_path, pubkey_der: bytes, backup: bool = True) -> PubkeyLoca
     try:
         dll.write_bytes(bytes(data))
     except PermissionError:
-        locked = dll.with_name(dll.name + ".locked")
-        if locked.exists():
-            raise PermissionError(
-                f"DLL 被进程占用且 {locked.name} 已存在，请手动处理"
-            )
-        os.rename(dll, locked)
-        dll.write_bytes(bytes(data))
-        print(f"提示: DLL 被进程占用，原文件已重命名为 {locked.name}")
+        _replace_occupied(dll, bytes(data))
     return loc
 
 
 def restore_pubkey(dll_path) -> Path:
     """从 .bak 恢复原版 DLL（被占用时自动重命名替换）。"""
-    import os
-
     dll = Path(dll_path)
     backup = dll.with_suffix(dll.suffix + ".bak")
     if not backup.exists():
@@ -251,14 +263,7 @@ def restore_pubkey(dll_path) -> Path:
     try:
         dll.write_bytes(data)
     except PermissionError:
-        locked = dll.with_name(dll.name + ".locked")
-        if locked.exists():
-            raise PermissionError(
-                f"DLL 被进程占用且 {locked.name} 已存在，请手动处理"
-            )
-        os.rename(dll, locked)
-        dll.write_bytes(data)
-        print(f"提示: DLL 被进程占用，原文件已重命名为 {locked.name}")
+        _replace_occupied(dll, data)
     return backup
 
 
